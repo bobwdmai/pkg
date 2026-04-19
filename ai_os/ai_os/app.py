@@ -187,6 +187,12 @@ class AIOSApp(tk.Tk):
             "stt_interrupt": True,
             "use_venv_runtime": True,
             "auto_write_files": False,
+            "byo_ai": {
+                "enabled": False,
+                "location": "local",
+                "endpoint": "http://127.0.0.1:11434",
+                "model": "qwen2.5-coder:3b",
+            },
             "file_permissions": {
                 "check_all": False,
                 "workspace": True,
@@ -227,6 +233,11 @@ class AIOSApp(tk.Tk):
             merged["stt_interrupt"] = bool(data.get("stt_interrupt", defaults["stt_interrupt"]))
             merged["use_venv_runtime"] = bool(data.get("use_venv_runtime", defaults["use_venv_runtime"]))
             merged["auto_write_files"] = bool(data.get("auto_write_files", defaults["auto_write_files"]))
+            raw_byo = data.get("byo_ai", {}) if isinstance(data.get("byo_ai", {}), dict) else {}
+            merged["byo_ai"]["enabled"] = bool(raw_byo.get("enabled", defaults["byo_ai"]["enabled"]))
+            merged["byo_ai"]["location"] = str(raw_byo.get("location", defaults["byo_ai"]["location"]))
+            merged["byo_ai"]["endpoint"] = str(raw_byo.get("endpoint", defaults["byo_ai"]["endpoint"]))
+            merged["byo_ai"]["model"] = str(raw_byo.get("model", defaults["byo_ai"]["model"]))
             raw_permissions = (
                 data.get("file_permissions", {})
                 if isinstance(data.get("file_permissions", {}), dict)
@@ -631,6 +642,7 @@ class AIOSApp(tk.Tk):
             "heavy": tk.BooleanVar(value=True),
         }
         self.model_role_widgets: dict[str, tk.Text] = {}
+        self.model_profiles_error_var = tk.StringVar(value="")
 
         for key, label in (("fallback", "Fallback 1.5B"), ("fast", "Fast 3B"), ("heavy", "Heavy 14B")):
             frame = ttk.Frame(model_box, style="TopBar.TFrame", padding=8)
@@ -651,6 +663,50 @@ class AIOSApp(tk.Tk):
             )
             role_text.pack(fill=tk.X)
             self.model_role_widgets[key] = role_text
+
+        ttk.Label(
+            model_box,
+            text=(
+                "Manual summary: default auto mode checks prompt size and keywords. "
+                "Heavy-routing keywords are: refactor, architecture, multi-file, optimize, debug, "
+                "test strategy, migration, production."
+            ),
+            style="Meta.TLabel",
+            wraplength=900,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(10, 2))
+
+        byo_box = ttk.Frame(model_box, style="TopBar.TFrame", padding=8)
+        byo_box.pack(fill=tk.X, pady=(2, 0))
+        self.byo_enabled_var = tk.BooleanVar(value=False)
+        self.byo_location_var = tk.StringVar(value="local")
+        self.byo_endpoint_var = tk.StringVar(value="http://127.0.0.1:11434")
+        self.byo_model_var = tk.StringVar(value="qwen2.5-coder:3b")
+
+        ttk.Checkbutton(
+            byo_box,
+            text="Bring your own AI (override default routing with one model endpoint)",
+            variable=self.byo_enabled_var,
+            style="Toggle.TCheckbutton",
+        ).pack(anchor="w")
+        loc_row = ttk.Frame(byo_box, style="TopBar.TFrame")
+        loc_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(loc_row, text="AI is:", style="Meta.TLabel").pack(side=tk.LEFT)
+        ttk.Radiobutton(loc_row, text="here", value="here", variable=self.byo_location_var).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(loc_row, text="local", value="local", variable=self.byo_location_var).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(byo_box, text="Endpoint", style="Meta.TLabel").pack(anchor="w", pady=(6, 2))
+        ttk.Entry(byo_box, textvariable=self.byo_endpoint_var).pack(fill=tk.X)
+        ttk.Label(byo_box, text="Model name", style="Meta.TLabel").pack(anchor="w", pady=(6, 2))
+        ttk.Entry(byo_box, textvariable=self.byo_model_var).pack(fill=tk.X)
+
+        ttk.Label(
+            model_box,
+            textvariable=self.model_profiles_error_var,
+            style="Meta.TLabel",
+            foreground="#FCA5A5",
+            wraplength=900,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(8, 0))
 
         button_row = ttk.Frame(parent, style="Panel.TFrame")
         button_row.pack(fill=tk.X, pady=(10, 0))
@@ -697,6 +753,7 @@ class AIOSApp(tk.Tk):
         self.stt_interrupt_var.set(bool(self.settings.get("stt_interrupt", True)))
         self.use_venv_var.set(bool(self.settings.get("use_venv_runtime", True)))
         self.auto_write_var.set(bool(self.settings.get("auto_write_files", False)))
+        self.model_profiles_error_var.set("")
         file_permissions = self.settings.get("file_permissions", {})
         self.perm_check_all_var.set(bool(file_permissions.get("check_all", False)))
         self.perm_workspace_var.set(bool(file_permissions.get("workspace", True)))
@@ -714,13 +771,34 @@ class AIOSApp(tk.Tk):
             widget = self.model_role_widgets[key]
             widget.delete("1.0", tk.END)
             widget.insert(tk.END, role)
+        byo = self.settings.get("byo_ai", {})
+        self.byo_enabled_var.set(bool(byo.get("enabled", False)))
+        self.byo_location_var.set(str(byo.get("location", "local")))
+        self.byo_endpoint_var.set(str(byo.get("endpoint", "http://127.0.0.1:11434")))
+        self.byo_model_var.set(str(byo.get("model", "qwen2.5-coder:3b")))
 
     def apply_settings(self) -> None:
+        if not any(self.model_vars[key].get() for key in ("fallback", "fast", "heavy")) and not self.byo_enabled_var.get():
+            self.model_profiles_error_var.set(
+                "Model Profiles error: enable at least one default model or enable Bring Your Own AI."
+            )
+            self.status_var.set("Settings error in Model Profiles")
+            self._append_console("[settings] Model Profiles error: all models disabled")
+            return
+        self.model_profiles_error_var.set("")
+
         self.settings["live_stt"] = self.live_stt_var.get()
         self.settings["live_tts"] = self.live_tts_var.get()
         self.settings["stt_interrupt"] = self.stt_interrupt_var.get()
         self.settings["use_venv_runtime"] = self.use_venv_var.get()
         self.settings["auto_write_files"] = self.auto_write_var.get()
+        self.settings["byo_ai"]["enabled"] = self.byo_enabled_var.get()
+        self.settings["byo_ai"]["location"] = self.byo_location_var.get().strip() or "local"
+        endpoint = self.byo_endpoint_var.get().strip()
+        if self.byo_location_var.get() == "local" and not endpoint:
+            endpoint = "http://127.0.0.1:11434"
+        self.settings["byo_ai"]["endpoint"] = endpoint
+        self.settings["byo_ai"]["model"] = self.byo_model_var.get().strip() or "qwen2.5-coder:3b"
         self.settings["file_permissions"]["check_all"] = self.perm_check_all_var.get()
         self.settings["file_permissions"]["workspace"] = self.perm_workspace_var.get()
         self.settings["file_permissions"]["home"] = self.perm_home_var.get()
@@ -1035,6 +1113,15 @@ class AIOSApp(tk.Tk):
             "fallback": str(models.get("fallback", {}).get("role", "")).strip(),
             "fast": str(models.get("fast", {}).get("role", "")).strip(),
             "heavy": str(models.get("heavy", {}).get("role", "")).strip(),
+        }
+
+    def _byo_ai_config(self) -> dict[str, str | bool]:
+        byo = self.settings.get("byo_ai", {})
+        return {
+            "enabled": bool(byo.get("enabled", False)),
+            "location": str(byo.get("location", "local")),
+            "endpoint": str(byo.get("endpoint", "http://127.0.0.1:11434")),
+            "model": str(byo.get("model", "qwen2.5-coder:3b")),
         }
 
     def _sync_live_audio_state(self) -> None:
@@ -1629,6 +1716,7 @@ class AIOSApp(tk.Tk):
             enabled_models=self._enabled_models(),
             model_roles=self._model_roles(),
             interruption_note=interruption_note,
+            byo_ai=self._byo_ai_config(),
         )
         self.after(0, lambda: self._on_agent_result(result.used_mode, result.response))
 
