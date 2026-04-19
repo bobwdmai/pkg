@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import os
 import queue
 import re
 import shutil
@@ -81,6 +82,8 @@ class AIOSApp(tk.Tk):
         self._run_first_launch_setup()
 
     def _run_first_launch_setup(self) -> None:
+        if not bool(self.settings.get("use_venv_runtime", True)):
+            return
         if self.first_run_marker.exists():
             return
         self._append_console("[setup] first launch detected: running auto setup/build")
@@ -136,6 +139,8 @@ class AIOSApp(tk.Tk):
         return importlib.util.find_spec(module_name) is not None
 
     def _first_launch_setup_worker(self) -> None:
+        if not bool(self.settings.get("use_venv_runtime", True)):
+            return
         self.app_data_dir.mkdir(parents=True, exist_ok=True)
         tasks: list[str] = []
         if not self._module_available("speech_recognition"):
@@ -180,6 +185,7 @@ class AIOSApp(tk.Tk):
             "live_stt": False,
             "live_tts": False,
             "stt_interrupt": True,
+            "use_venv_runtime": True,
             "auto_write_files": False,
             "file_permissions": {
                 "check_all": False,
@@ -219,6 +225,7 @@ class AIOSApp(tk.Tk):
             merged["live_stt"] = bool(data.get("live_stt", defaults["live_stt"]))
             merged["live_tts"] = bool(data.get("live_tts", defaults["live_tts"]))
             merged["stt_interrupt"] = bool(data.get("stt_interrupt", defaults["stt_interrupt"]))
+            merged["use_venv_runtime"] = bool(data.get("use_venv_runtime", defaults["use_venv_runtime"]))
             merged["auto_write_files"] = bool(data.get("auto_write_files", defaults["auto_write_files"]))
             raw_permissions = (
                 data.get("file_permissions", {})
@@ -453,7 +460,17 @@ class AIOSApp(tk.Tk):
         self.code_editor.insert(tk.END, "# Write or load Python code here.\nprint('hello from AI OS')\n")
         self._refresh_file_tree()
 
-        ttk.Label(parent, text="Console", style="Meta.TLabel").pack(anchor="w", pady=(8, 0))
+        io_header = ttk.Frame(parent, style="Panel.TFrame")
+        io_header.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(io_header, text="Console", style="Meta.TLabel").pack(side=tk.LEFT)
+        self.io_mode_var = tk.StringVar(value="console")
+        ttk.Button(io_header, text="Console", style="Ghost.TButton", command=lambda: self._set_io_mode("console")).pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+        ttk.Button(io_header, text="Terminal", style="Ghost.TButton", command=lambda: self._set_io_mode("terminal")).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
         self.console = scrolledtext.ScrolledText(
             parent,
             wrap=tk.WORD,
@@ -469,6 +486,33 @@ class AIOSApp(tk.Tk):
         self.console.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
         self.console.insert(tk.END, "Console ready.\n")
         self.console.config(state=tk.DISABLED)
+
+        self.terminal_wrap = ttk.Frame(parent, style="Panel.TFrame")
+        self.terminal_wrap.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
+        term_input_row = ttk.Frame(self.terminal_wrap, style="Panel.TFrame")
+        term_input_row.pack(fill=tk.X)
+        self.terminal_entry = ttk.Entry(term_input_row)
+        self.terminal_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.terminal_entry.bind("<Return>", lambda _event: self.run_terminal_command())
+        ttk.Button(term_input_row, text="Run", style="Primary.TButton", command=self.run_terminal_command).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        self.terminal_output = scrolledtext.ScrolledText(
+            self.terminal_wrap,
+            wrap=tk.WORD,
+            height=9,
+            bg="#030712",
+            fg="#E5E7EB",
+            insertbackground="#E5E7EB",
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+            font=("Consolas", 10),
+        )
+        self.terminal_output.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        self.terminal_output.insert(tk.END, "Terminal ready.\n")
+        self.terminal_output.config(state=tk.DISABLED)
+        self.terminal_wrap.pack_forget()
 
     def _build_settings_panel(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Voice + Model Settings", style="Title.TLabel").pack(anchor="w")
@@ -486,6 +530,7 @@ class AIOSApp(tk.Tk):
         self.live_stt_var = tk.BooleanVar(value=False)
         self.live_tts_var = tk.BooleanVar(value=False)
         self.stt_interrupt_var = tk.BooleanVar(value=True)
+        self.use_venv_var = tk.BooleanVar(value=True)
 
         ttk.Checkbutton(voice_box, text="Enable Live STT", variable=self.live_stt_var, style="Toggle.TCheckbutton").pack(anchor="w")
         ttk.Checkbutton(voice_box, text="Enable Live TTS", variable=self.live_tts_var, style="Toggle.TCheckbutton").pack(anchor="w", pady=(4, 0))
@@ -493,6 +538,12 @@ class AIOSApp(tk.Tk):
             voice_box,
             text="Interrupt TTS when user starts speaking",
             variable=self.stt_interrupt_var,
+            style="Toggle.TCheckbutton",
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(
+            voice_box,
+            text="Use venv runtime (Python execution + setup)",
+            variable=self.use_venv_var,
             style="Toggle.TCheckbutton",
         ).pack(anchor="w", pady=(4, 0))
         self.auto_write_var = tk.BooleanVar(value=False)
@@ -644,6 +695,7 @@ class AIOSApp(tk.Tk):
         self.live_stt_var.set(bool(self.settings.get("live_stt", False)))
         self.live_tts_var.set(bool(self.settings.get("live_tts", False)))
         self.stt_interrupt_var.set(bool(self.settings.get("stt_interrupt", True)))
+        self.use_venv_var.set(bool(self.settings.get("use_venv_runtime", True)))
         self.auto_write_var.set(bool(self.settings.get("auto_write_files", False)))
         file_permissions = self.settings.get("file_permissions", {})
         self.perm_check_all_var.set(bool(file_permissions.get("check_all", False)))
@@ -667,6 +719,7 @@ class AIOSApp(tk.Tk):
         self.settings["live_stt"] = self.live_stt_var.get()
         self.settings["live_tts"] = self.live_tts_var.get()
         self.settings["stt_interrupt"] = self.stt_interrupt_var.get()
+        self.settings["use_venv_runtime"] = self.use_venv_var.get()
         self.settings["auto_write_files"] = self.auto_write_var.get()
         self.settings["file_permissions"]["check_all"] = self.perm_check_all_var.get()
         self.settings["file_permissions"]["workspace"] = self.perm_workspace_var.get()
@@ -1484,6 +1537,53 @@ class AIOSApp(tk.Tk):
         self.console.see(tk.END)
         self.console.config(state=tk.DISABLED)
 
+    def _append_terminal(self, text: str) -> None:
+        self.terminal_output.config(state=tk.NORMAL)
+        self.terminal_output.insert(tk.END, text + "\n")
+        self.terminal_output.see(tk.END)
+        self.terminal_output.config(state=tk.DISABLED)
+
+    def _set_io_mode(self, mode: str) -> None:
+        self.io_mode_var.set(mode)
+        if mode == "terminal":
+            self.console.pack_forget()
+            self.terminal_wrap.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
+            self.terminal_entry.focus_set()
+        else:
+            self.terminal_wrap.pack_forget()
+            self.console.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
+
+    def run_terminal_command(self) -> None:
+        cmd = self.terminal_entry.get().strip()
+        if not cmd:
+            return
+        self.terminal_entry.delete(0, tk.END)
+        self._append_terminal(f"$ {cmd}")
+        worker = threading.Thread(target=self._run_terminal_worker, args=(cmd,), daemon=True)
+        worker.start()
+
+    def _run_terminal_worker(self, cmd: str) -> None:
+        env = dict(os.environ)
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", cmd],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=str(self.workspace_root),
+                env=env,
+            )
+            stdout = proc.stdout.rstrip("\n")
+            stderr = proc.stderr.rstrip("\n")
+            exit_line = f"[exit code {proc.returncode}]"
+            self.after(0, lambda: self._append_terminal(stdout) if stdout else None)
+            self.after(0, lambda: self._append_terminal(stderr) if stderr else None)
+            self.after(0, lambda: self._append_terminal(exit_line))
+        except subprocess.TimeoutExpired:
+            self.after(0, lambda: self._append_terminal("[timeout] command exceeded 120s"))
+        except Exception as exc:
+            self.after(0, lambda: self._append_terminal(f"[terminal error] {exc}"))
+
     def send_prompt(self) -> None:
         prompt = self.prompt_input.get("1.0", tk.END).strip()
         if not prompt:
@@ -1571,8 +1671,13 @@ class AIOSApp(tk.Tk):
             self.status_var.set("Run denied by file-type permissions")
             return
         self._append_console("Running code...")
+        python_cmd = "python3"
+        if bool(self.settings.get("use_venv_runtime", True)):
+            venv_python = self.venv_dir / "bin" / "python3"
+            if venv_python.exists():
+                python_cmd = str(venv_python)
         try:
-            result = run_source_code(source, file_extension=ext)
+            result = run_source_code(source, file_extension=ext, python_cmd=python_cmd)
         except subprocess.TimeoutExpired:
             self._append_console("[run timeout] execution exceeded 20s")
             return

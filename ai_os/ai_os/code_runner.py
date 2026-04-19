@@ -74,7 +74,12 @@ def _compiled_run_cmd(file_path: Path) -> list[str] | None:
     return None
 
 
-def run_source_code(source_code: str, file_extension: str = ".py", timeout: int = 20) -> RunResult:
+def run_source_code(
+    source_code: str,
+    file_extension: str = ".py",
+    timeout: int = 20,
+    python_cmd: str = "python3",
+) -> RunResult:
     run_dir = Path("/tmp/ai_os_runs")
     run_dir.mkdir(parents=True, exist_ok=True)
     normalized_ext = (file_extension or ".py").strip().lower()
@@ -91,7 +96,9 @@ def run_source_code(source_code: str, file_extension: str = ".py", timeout: int 
     if compiled_cmd is not None:
         cmd = compiled_cmd
     else:
-        runner = RUNNER_BY_EXTENSION.get(normalized_ext, ["python3"])
+        runner = RUNNER_BY_EXTENSION.get(normalized_ext, [python_cmd])
+        if normalized_ext == ".py":
+            runner = [python_cmd]
         if runner and shutil.which(runner[0]) is None:
             return RunResult(
                 return_code=127,
