@@ -9,8 +9,14 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+import zipfile
+from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 from .agent import AiderStyleAgent
 from .code_runner import run_source_code
@@ -22,6 +28,8 @@ except Exception:  # pragma: no cover
 
 
 class AIOSApp(tk.Tk):
+    VOICE_INDICATOR_PREFIX = "[voice-wave] "
+
     def __init__(self) -> None:
         super().__init__()
         self.title("AI OS")
@@ -39,6 +47,9 @@ class AIOSApp(tk.Tk):
         self.first_run_marker = self.settings_path.parent / ".first_run_complete"
         self.app_data_dir = Path.home() / ".local" / "share" / "ai-os"
         self.venv_dir = self.app_data_dir / "venv"
+        self.chats_dir = self.app_data_dir / "chats"
+        self.chats_dir.mkdir(parents=True, exist_ok=True)
+        self.chat_session_file = self._new_chat_session_file()
         repo_candidate = Path.home() / "ai-os"
         self.workspace_root = repo_candidate.resolve() if repo_candidate.exists() else Path.cwd().resolve()
 
@@ -48,6 +59,12 @@ class AIOSApp(tk.Tk):
         self.tts_process: subprocess.Popen[str] | None = None
         self.tts_lock = threading.Lock()
         self.tts_interrupted = False
+        self.mic_hold_recording = False
+        self.mic_record_process: subprocess.Popen[str] | None = None
+        self.mic_record_wav_path: Path | None = None
+        self.mic_record_temp_dir: str | None = None
+        self.voice_wave_job: str | None = None
+        self.voice_wave_frame = 0
 
         self._init_speech_backend()
         self.sr_recognizer = sr.Recognizer() if sr else None
@@ -69,6 +86,33 @@ class AIOSApp(tk.Tk):
         self._append_console("[setup] first launch detected: running auto setup/build")
         worker = threading.Thread(target=self._first_launch_setup_worker, daemon=True)
         worker.start()
+
+    def _new_chat_session_file(self) -> Path:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = self.chats_dir / f"chat_{stamp}.md"
+        header = f"# AI OS Chat Session ({datetime.now().isoformat(timespec='seconds')})\n\n"
+        file_path.write_text(header, encoding="utf-8")
+        return file_path
+
+    def _append_chat_history(self, role: str, text: str) -> None:
+        try:
+            time_label = datetime.now().strftime("%H:%M:%S")
+            entry = f"## [{time_label}] {role}\n\n{text}\n\n"
+            with open(self.chat_session_file, "a", encoding="utf-8") as file_handle:
+                file_handle.write(entry)
+        except Exception as exc:
+            self._append_console(f"[chat-save] failed: {exc}")
+
+    def open_chats_folder(self) -> None:
+        try:
+            opener = shutil.which("xdg-open")
+            if not opener:
+                self._append_console(f"[chat-save] chats folder: {self.chats_dir}")
+                return
+            subprocess.Popen([opener, str(self.chats_dir)])
+            self._append_console(f"[chat-save] opened {self.chats_dir}")
+        except Exception as exc:
+            self._append_console(f"[chat-save] open folder failed: {exc}")
 
     def _init_speech_backend(self) -> None:
         global sr
@@ -265,6 +309,10 @@ class AIOSApp(tk.Tk):
 
         ttk.Button(sidebar, text="New Chat", style="Ghost.TButton", command=self.clear_chat).pack(fill=tk.X, pady=(0, 8))
         ttk.Button(sidebar, text="Send Editor To AI", style="Ghost.TButton", command=self.send_editor_to_ai).pack(fill=tk.X)
+        ttk.Button(sidebar, text="Open Chats Folder", style="Ghost.TButton", command=self.open_chats_folder).pack(
+            fill=tk.X,
+            pady=(8, 0),
+        )
 
         ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
 
@@ -296,13 +344,16 @@ class AIOSApp(tk.Tk):
         chat_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=0)
         code_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=10)
         settings_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=12)
+        marketplace_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=12)
 
         workspace.add(chat_tab, text="Chat")
         workspace.add(code_tab, text="Code")
+        workspace.add(marketplace_tab, text="Marketplace")
         workspace.add(settings_tab, text="Settings")
 
         self._build_chat_tab(chat_tab)
         self._build_code_panel(code_tab)
+        self._build_marketplace_tab(marketplace_tab)
         self._build_settings_panel(settings_tab)
 
     def _build_chat_tab(self, parent: ttk.Frame) -> None:
@@ -347,13 +398,15 @@ class AIOSApp(tk.Tk):
         self.prompt_input.bind("<Return>", self._on_enter_pressed)
         self.prompt_input.bind("<Shift-Return>", lambda _event: None)
 
-        mic_btn = ttk.Button(
+        self.mic_btn = ttk.Button(
             composer,
             text="Mic",
             style="Ghost.TButton",
-            command=self.start_manual_stt,
+            command=lambda: None,
         )
-        mic_btn.grid(row=0, column=1, sticky="se", padx=(10, 0))
+        self.mic_btn.grid(row=0, column=1, sticky="se", padx=(10, 0))
+        self.mic_btn.bind("<ButtonPress-1>", self._on_mic_press)
+        self.mic_btn.bind("<ButtonRelease-1>", self._on_mic_release)
 
         send_btn = ttk.Button(composer, text="Send", style="Primary.TButton", command=self.send_prompt)
         send_btn.grid(row=0, column=2, sticky="se", padx=(10, 0))
@@ -363,12 +416,29 @@ class AIOSApp(tk.Tk):
 
         editor_row = ttk.Frame(parent, style="Panel.TFrame")
         editor_row.pack(fill=tk.X, pady=(8, 8))
+        ttk.Button(editor_row, text="Open Folder", style="Ghost.TButton", command=self.open_folder).pack(side=tk.LEFT)
+        ttk.Button(editor_row, text="New Folder", style="Ghost.TButton", command=self.create_folder).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(editor_row, text="Save Folder", style="Ghost.TButton", command=self.save_folder_snapshot).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(editor_row, text="Open File", style="Ghost.TButton", command=self.open_file).pack(side=tk.LEFT)
         ttk.Button(editor_row, text="Save File", style="Ghost.TButton", command=self.save_file).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(editor_row, text="Run Code", style="Primary.TButton", command=self.run_code).pack(side=tk.LEFT, padx=(8, 0))
 
+        body = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        explorer_panel = ttk.Frame(body, style="TopBar.TFrame", padding=6)
+        editor_panel = ttk.Frame(body, style="Panel.TFrame", padding=0)
+        body.add(explorer_panel, weight=1)
+        body.add(editor_panel, weight=4)
+
+        ttk.Label(explorer_panel, text="Explorer", style="Meta.TLabel").pack(anchor="w", pady=(0, 6))
+        self.file_tree = ttk.Treeview(explorer_panel, show="tree")
+        self.file_tree.pack(fill=tk.BOTH, expand=True)
+        self.file_tree.bind("<<TreeviewOpen>>", self._on_tree_open)
+        self.file_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
         self.code_editor = scrolledtext.ScrolledText(
-            parent,
+            editor_panel,
             wrap=tk.NONE,
             height=20,
             bg="#0B1220",
@@ -381,6 +451,7 @@ class AIOSApp(tk.Tk):
         )
         self.code_editor.pack(fill=tk.BOTH, expand=True)
         self.code_editor.insert(tk.END, "# Write or load Python code here.\nprint('hello from AI OS')\n")
+        self._refresh_file_tree()
 
         ttk.Label(parent, text="Console", style="Meta.TLabel").pack(anchor="w", pady=(8, 0))
         self.console = scrolledtext.ScrolledText(
@@ -534,6 +605,41 @@ class AIOSApp(tk.Tk):
         button_row.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(button_row, text="Apply Settings", style="Primary.TButton", command=self.apply_settings).pack(side=tk.LEFT)
 
+    def _build_marketplace_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Extensions Marketplace (Open VSX Clone)", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            parent,
+            text="Search community extensions and open install pages. This mimics a VS Code marketplace flow.",
+            style="Meta.TLabel",
+            wraplength=900,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(2, 8))
+
+        row = ttk.Frame(parent, style="Panel.TFrame")
+        row.pack(fill=tk.X)
+        self.marketplace_query = tk.StringVar(value="python")
+        ttk.Entry(row, textvariable=self.marketplace_query).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row, text="Search", style="Primary.TButton", command=self.search_marketplace).pack(side=tk.LEFT, padx=(8, 0))
+
+        self.marketplace_list = tk.Listbox(
+            parent,
+            bg="#0B1220",
+            fg="#E5E7EB",
+            selectbackground="#1F2937",
+            selectforeground="#E5E7EB",
+            relief=tk.FLAT,
+            height=18,
+        )
+        self.marketplace_list.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        self.marketplace_items: list[dict[str, str]] = []
+
+        action_row = ttk.Frame(parent, style="Panel.TFrame")
+        action_row.pack(fill=tk.X)
+        ttk.Button(action_row, text="Open Extension Page", style="Ghost.TButton", command=self.open_selected_extension_page).pack(side=tk.LEFT)
+        ttk.Button(action_row, text="Copy Install Hint", style="Ghost.TButton", command=self.copy_extension_hint).pack(side=tk.LEFT, padx=(8, 0))
+
+        self.search_marketplace()
+
     def _apply_settings_to_ui(self) -> None:
         self.live_stt_var.set(bool(self.settings.get("live_stt", False)))
         self.live_tts_var.set(bool(self.settings.get("live_tts", False)))
@@ -596,6 +702,166 @@ class AIOSApp(tk.Tk):
     def _on_all_types_toggled(self) -> None:
         state = tk.DISABLED if self.perm_all_types_var.get() else tk.NORMAL
         self.allowed_ext_entry.configure(state=state)
+
+    def _refresh_file_tree(self) -> None:
+        if not hasattr(self, "file_tree"):
+            return
+        self.file_tree.delete(*self.file_tree.get_children())
+        root_id = self.file_tree.insert("", tk.END, text=str(self.workspace_root), open=True, values=(str(self.workspace_root), "dir"))
+        self._insert_tree_children(root_id, self.workspace_root)
+
+    def _insert_tree_children(self, parent_id: str, folder: Path) -> None:
+        try:
+            entries = sorted(folder.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except Exception:
+            return
+        for entry in entries:
+            if entry.name.startswith(".git"):
+                continue
+            node_id = self.file_tree.insert(
+                parent_id,
+                tk.END,
+                text=entry.name,
+                values=(str(entry), "file" if entry.is_file() else "dir"),
+            )
+            if entry.is_dir():
+                self.file_tree.insert(node_id, tk.END, text="...")
+
+    def _on_tree_open(self, _event: tk.Event) -> None:
+        selected = self.file_tree.focus()
+        if not selected:
+            return
+        values = self.file_tree.item(selected, "values")
+        if not values:
+            return
+        path = Path(values[0])
+        kind = values[1] if len(values) > 1 else ""
+        if kind != "dir":
+            return
+        self.file_tree.delete(*self.file_tree.get_children(selected))
+        self._insert_tree_children(selected, path)
+
+    def _on_tree_select(self, _event: tk.Event) -> None:
+        selected = self.file_tree.focus()
+        if not selected:
+            return
+        values = self.file_tree.item(selected, "values")
+        if not values:
+            return
+        path = Path(values[0])
+        kind = values[1] if len(values) > 1 else ""
+        if kind == "file":
+            self._load_file_to_editor(path)
+
+    def _load_file_to_editor(self, path: Path) -> None:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            self._append_console(f"[explorer] open failed: {exc}")
+            return
+        self.code_editor.delete("1.0", tk.END)
+        self.code_editor.insert(tk.END, content)
+        self.current_file_path = path.resolve()
+        self._append_console(f"Loaded file: {path}")
+
+    def open_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Open workspace folder")
+        if not selected:
+            return
+        self.workspace_root = Path(selected).resolve()
+        self._append_console(f"[explorer] workspace: {self.workspace_root}")
+        self._refresh_file_tree()
+
+    def create_folder(self) -> None:
+        relative = simpledialog.askstring("New Folder", "Folder path (relative to workspace):")
+        if not relative:
+            return
+        target = (self.workspace_root / relative).resolve()
+        if not self._is_path_allowed(target):
+            self._append_console(f"[explorer] create denied: {target}")
+            return
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            self._append_console(f"[explorer] created folder: {target}")
+            self._refresh_file_tree()
+        except Exception as exc:
+            self._append_console(f"[explorer] create failed: {exc}")
+
+    def save_folder_snapshot(self) -> None:
+        out_path = filedialog.asksaveasfilename(
+            title="Save workspace snapshot",
+            defaultextension=".zip",
+            filetypes=[("Zip archive", "*.zip"), ("All files", "*.*")],
+        )
+        if not out_path:
+            return
+        try:
+            with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                for file_path in self.workspace_root.rglob("*"):
+                    if file_path.is_file():
+                        rel = file_path.relative_to(self.workspace_root)
+                        archive.write(file_path, rel.as_posix())
+            self._append_console(f"[explorer] workspace saved: {out_path}")
+        except Exception as exc:
+            self._append_console(f"[explorer] snapshot failed: {exc}")
+
+    def search_marketplace(self) -> None:
+        query = self.marketplace_query.get().strip() if hasattr(self, "marketplace_query") else ""
+        worker = threading.Thread(target=self._search_marketplace_worker, args=(query,), daemon=True)
+        worker.start()
+
+    def _search_marketplace_worker(self, query: str) -> None:
+        q = query or "python"
+        url = f"https://open-vsx.org/api/-/search?query={urllib.parse.quote(q)}&size=25"
+        items: list[dict[str, str]] = []
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            for ext in data.get("extensions", []):
+                namespace = str(ext.get("namespace", ""))
+                name = str(ext.get("name", ""))
+                display = str(ext.get("displayName") or f"{namespace}.{name}")
+                version = str(ext.get("version", ""))
+                homepage = str(ext.get("homepage") or f"https://open-vsx.org/extension/{namespace}/{name}")
+                items.append(
+                    {
+                        "id": f"{namespace}.{name}",
+                        "display": display,
+                        "version": version,
+                        "homepage": homepage,
+                    }
+                )
+        except Exception as exc:
+            self.after(0, lambda: self._append_console(f"[marketplace] search failed: {exc}"))
+            return
+        self.after(0, lambda: self._update_marketplace_list(items))
+
+    def _update_marketplace_list(self, items: list[dict[str, str]]) -> None:
+        self.marketplace_items = items
+        self.marketplace_list.delete(0, tk.END)
+        for item in items:
+            self.marketplace_list.insert(tk.END, f"{item['display']} ({item['id']}) v{item['version']}")
+        self._append_console(f"[marketplace] loaded {len(items)} extensions")
+
+    def open_selected_extension_page(self) -> None:
+        if not self.marketplace_list.curselection():
+            return
+        idx = int(self.marketplace_list.curselection()[0])
+        if idx < 0 or idx >= len(self.marketplace_items):
+            return
+        webbrowser.open(self.marketplace_items[idx]["homepage"])
+
+    def copy_extension_hint(self) -> None:
+        if not self.marketplace_list.curselection():
+            return
+        idx = int(self.marketplace_list.curselection()[0])
+        if idx < 0 or idx >= len(self.marketplace_items):
+            return
+        ext_id = self.marketplace_items[idx]["id"]
+        hint = f"code --install-extension {ext_id}"
+        self.clipboard_clear()
+        self.clipboard_append(hint)
+        self._append_console(f"[marketplace] copied: {hint}")
 
     def _allowed_roots(self) -> list[Path]:
         file_permissions = self.settings.get("file_permissions", {})
@@ -786,22 +1052,192 @@ class AIOSApp(tk.Tk):
             return
         self.after(0, lambda: self._handle_voice_prompt(text))
 
-    def start_manual_stt(self) -> None:
-        if sr is None or not self.sr_recognizer:
-            fallback_text = self._manual_stt_external_fallback()
-            if fallback_text:
-                self._manual_stt_success(fallback_text)
-                return
-            self._append_console(
-                "[voice] manual STT unavailable. Install: sudo apt install python3-pyaudio python3-venv python3-pip"
-            )
-            self.status_var.set("Manual STT unavailable")
+    def _on_mic_press(self, _event: tk.Event) -> str:
+        self._start_hold_to_talk()
+        return "break"
+
+    def _on_mic_release(self, _event: tk.Event) -> str:
+        self._stop_hold_to_talk()
+        return "break"
+
+    def _start_hold_to_talk(self) -> None:
+        if self.mic_hold_recording:
+            return
+        arecord_bin = shutil.which("arecord")
+        if not arecord_bin:
+            self.status_var.set("Mic unavailable (missing arecord)")
+            self._append_console("[voice] hold-to-talk requires arecord")
             return
 
-        self.status_var.set("Listening (manual STT)...")
-        self._append_console("[voice] manual STT listening...")
-        worker = threading.Thread(target=self._manual_stt_worker, daemon=True)
+        temp_dir = tempfile.mkdtemp(prefix="ai_os_hold_stt_")
+        wav_path = Path(temp_dir) / "hold.wav"
+        cmd_record = [
+            arecord_bin,
+            "-q",
+            "-f",
+            "S16_LE",
+            "-r",
+            "16000",
+            "-c",
+            "1",
+            str(wav_path),
+        ]
+        try:
+            proc: subprocess.Popen[str] = subprocess.Popen(
+                cmd_record,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as exc:
+            self.status_var.set("Mic start failed")
+            self._append_console(f"[voice] hold-to-talk start failed: {exc}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+
+        self.mic_hold_recording = True
+        self.mic_record_process = proc
+        self.mic_record_wav_path = wav_path
+        self.mic_record_temp_dir = temp_dir
+        self.status_var.set("Hold mic and speak...")
+        self._start_voice_wave_indicator()
+
+    def _stop_hold_to_talk(self) -> None:
+        if not self.mic_hold_recording:
+            return
+        self.mic_hold_recording = False
+        self._stop_voice_wave_indicator()
+        self.status_var.set("Transcribing...")
+
+        proc = self.mic_record_process
+        wav_path = self.mic_record_wav_path
+        temp_dir = self.mic_record_temp_dir
+        self.mic_record_process = None
+        self.mic_record_wav_path = None
+        self.mic_record_temp_dir = None
+
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        if not wav_path or not wav_path.exists():
+            self.status_var.set("No mic audio captured")
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+
+        worker = threading.Thread(
+            target=self._transcribe_hold_audio_worker,
+            args=(wav_path, temp_dir),
+            daemon=True,
+        )
         worker.start()
+
+    def _start_voice_wave_indicator(self) -> None:
+        self.voice_wave_frame = 0
+        self._animate_voice_wave_indicator()
+
+    def _stop_voice_wave_indicator(self) -> None:
+        if self.voice_wave_job:
+            try:
+                self.after_cancel(self.voice_wave_job)
+            except Exception:
+                pass
+        self.voice_wave_job = None
+        self._render_voice_indicator("")
+
+    def _prompt_without_voice_indicator(self) -> str:
+        current = self.prompt_input.get("1.0", tk.END)
+        lines = current.splitlines()
+        if lines and lines[0].startswith(self.VOICE_INDICATOR_PREFIX):
+            lines = lines[1:]
+        return "\n".join(lines).strip()
+
+    def _render_voice_indicator(self, indicator: str) -> None:
+        body = self._prompt_without_voice_indicator()
+        self.prompt_input.delete("1.0", tk.END)
+        if indicator:
+            self.prompt_input.insert(tk.END, f"{self.VOICE_INDICATOR_PREFIX}{indicator}\n")
+        if body:
+            self.prompt_input.insert(tk.END, body)
+        self.prompt_input.focus_set()
+
+    def _animate_voice_wave_indicator(self) -> None:
+        if not self.mic_hold_recording:
+            return
+        frames = [
+            "[|     ]",
+            "[||    ]",
+            "[|||   ]",
+            "[ |||  ]",
+            "[  ||| ]",
+            "[   |||]",
+            "[  ||| ]",
+            "[ |||  ]",
+        ]
+        indicator = f"Hold to talk {frames[self.voice_wave_frame % len(frames)]}"
+        self._render_voice_indicator(indicator)
+        self.voice_wave_frame += 1
+        self.voice_wave_job = self.after(110, self._animate_voice_wave_indicator)
+
+    def _transcribe_hold_audio_worker(self, wav_path: Path, temp_dir: str | None) -> None:
+        text = ""
+        if sr is not None and self.sr_recognizer is not None:
+            try:
+                with sr.AudioFile(str(wav_path)) as source:
+                    audio = self.sr_recognizer.record(source)
+                text = self.sr_recognizer.recognize_google(audio).strip()
+            except Exception:
+                try:
+                    with sr.AudioFile(str(wav_path)) as source:
+                        audio = self.sr_recognizer.record(source)
+                    text = self.sr_recognizer.recognize_sphinx(audio).strip()
+                except Exception:
+                    text = ""
+        if not text:
+            text = self._transcribe_with_whisper(wav_path)
+
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if text:
+            self.after(0, lambda: self._manual_stt_success(text))
+        else:
+            self.after(0, lambda: self._manual_stt_failed("[voice] no speech recognized"))
+
+    def _transcribe_with_whisper(self, wav_path: Path) -> str:
+        whisper_bin = shutil.which("whisper")
+        if not whisper_bin:
+            return ""
+        out_dir = wav_path.parent
+        cmd_whisper = [
+            whisper_bin,
+            str(wav_path),
+            "--model",
+            "tiny",
+            "--language",
+            "en",
+            "--output_format",
+            "txt",
+            "--output_dir",
+            str(out_dir),
+        ]
+        try:
+            tr = subprocess.run(cmd_whisper, capture_output=True, text=True, timeout=60)
+        except Exception:
+            return ""
+        if tr.returncode != 0:
+            return ""
+        txt_path = out_dir / f"{wav_path.stem}.txt"
+        if not txt_path.exists():
+            return ""
+        return txt_path.read_text(encoding="utf-8").strip()
 
     def _manual_stt_external_fallback(self) -> str:
         arecord_bin = shutil.which("arecord")
@@ -895,11 +1331,23 @@ class AIOSApp(tk.Tk):
         self._handle_voice_prompt(text)
 
     def _handle_voice_prompt(self, text: str) -> None:
+        self._insert_voice_text_into_prompt(text)
         if self.pending_response:
-            self.voice_prompt_queue.put(text)
-            self.status_var.set("Voice captured; queued while current response finishes")
+            self.status_var.set("Voice captured into input (AI still responding)")
+        else:
+            self.status_var.set("Voice captured into input (edit and press Send)")
+
+    def _insert_voice_text_into_prompt(self, text: str) -> None:
+        cleaned = text.strip()
+        if not cleaned:
             return
-        self._send_prompt_text(text, source="voice")
+        existing = self.prompt_input.get("1.0", tk.END).strip()
+        self.prompt_input.delete("1.0", tk.END)
+        if existing:
+            self.prompt_input.insert(tk.END, f"{existing}\n{cleaned}")
+        else:
+            self.prompt_input.insert(tk.END, cleaned)
+        self.prompt_input.focus_set()
 
     def _interrupt_tts(self, reason: str) -> None:
         with self.tts_lock:
@@ -925,7 +1373,6 @@ class AIOSApp(tk.Tk):
 
     def _speak_text(self, text: str) -> None:
         if not self.settings.get("live_tts", False):
-            self._append_console("[voice] live TTS is disabled in Settings")
             return
         cleaned = text.strip()
         if not cleaned:
@@ -1023,6 +1470,7 @@ class AIOSApp(tk.Tk):
 
         self._bubble_refs.append(row)
         self._scroll_to_bottom()
+        self._append_chat_history(role, text)
 
     def _add_user_message(self, text: str) -> None:
         self._add_message("user", text)
@@ -1102,6 +1550,7 @@ class AIOSApp(tk.Tk):
         for bubble in self._bubble_refs:
             bubble.destroy()
         self._bubble_refs.clear()
+        self.chat_session_file = self._new_chat_session_file()
         self.status_var.set("Ready")
         self._add_assistant_message(
             "New chat started. I can be interrupted by speech when Live STT/TTS is enabled in Settings."
@@ -1152,37 +1601,48 @@ class AIOSApp(tk.Tk):
         self.send_prompt()
 
     def open_file(self) -> None:
-        path = filedialog.askopenfilename(title="Open source file")
+        path = filedialog.askopenfilename(title="Open source file", initialdir=str(self.workspace_root))
         if not path:
             return
         try:
-            with open(path, "r", encoding="utf-8") as file_handle:
+            selected_path = Path(path).resolve()
+            if not self._is_path_allowed(selected_path):
+                self._append_console(f"[explorer] open denied: {selected_path}")
+                return
+            with open(selected_path, "r", encoding="utf-8") as file_handle:
                 content = file_handle.read()
         except Exception as exc:
             messagebox.showerror("Open file failed", str(exc))
             return
         self.code_editor.delete("1.0", tk.END)
         self.code_editor.insert(tk.END, content)
-        self.current_file_path = Path(path).resolve()
-        self._append_console(f"Loaded file: {path}")
+        self.current_file_path = selected_path
+        self._append_console(f"Loaded file: {selected_path}")
 
     def save_file(self) -> None:
-        path = filedialog.asksaveasfilename(title="Save source file")
+        initial = str(self.current_file_path) if self.current_file_path else ""
+        path = filedialog.asksaveasfilename(title="Save source file", initialdir=str(self.workspace_root), initialfile=Path(initial).name if initial else "")
         if not path:
             return
         content = self.code_editor.get("1.0", tk.END)
+        target = Path(path).resolve()
+        if not self._is_path_allowed(target):
+            self._append_console(f"[explorer] save denied: {target}")
+            return
         try:
-            with open(path, "w", encoding="utf-8") as file_handle:
+            with open(target, "w", encoding="utf-8") as file_handle:
                 file_handle.write(content)
         except Exception as exc:
             messagebox.showerror("Save file failed", str(exc))
             return
-        self.current_file_path = Path(path).resolve()
-        self._append_console(f"Saved file: {path}")
+        self.current_file_path = target
+        self._append_console(f"Saved file: {target}")
+        self._refresh_file_tree()
 
     def destroy(self) -> None:
         self._stop_live_stt()
         self._interrupt_tts("app shutdown")
+        self._stop_hold_to_talk()
         super().destroy()
 
 
