@@ -31,7 +31,29 @@ class AiderStyleAgent:
         enabled_models: Optional[dict[str, bool]] = None,
         model_roles: Optional[dict[str, str]] = None,
         interruption_note: str = "",
+        byo_ai: Optional[dict[str, str | bool]] = None,
     ) -> AgentResult:
+        byo_enabled = bool((byo_ai or {}).get("enabled", False))
+        if byo_enabled:
+            endpoint = str((byo_ai or {}).get("endpoint", "http://127.0.0.1:11434")).strip()
+            model = str((byo_ai or {}).get("model", "qwen2.5-coder:3b")).strip()
+            location = str((byo_ai or {}).get("location", "local")).strip() or "local"
+            if not endpoint:
+                endpoint = "http://127.0.0.1:11434"
+            if not model:
+                model = "qwen2.5-coder:3b"
+
+            assembled_prompt = (
+                f"{SYSTEM_PROMPT}\n\n"
+                f"Active model profile: byo-ai ({location})\n"
+                f"Profile instruction: [bring-your-own-ai override]\n"
+                f"Interruption context: {interruption_note or '[none]'}\n\n"
+                f"User request:\n{user_prompt}\n\n"
+                "Respond now:"
+            )
+            response = self.client.chat_to(endpoint=endpoint, model=model, prompt=assembled_prompt)
+            return AgentResult(prompt=user_prompt, response=response, used_mode=f"{mode}->byo")
+
         endpoint, model, model_key, routed_mode = self.client.resolve_target(
             prompt=user_prompt,
             mode=mode,
