@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 class AIOSApp(tk.Tk):
     VOICE_INDICATOR_PREFIX = "[voice-wave] "
 
-    def __init__(self) -> None:
+    def __init__(self, startup_path: str | None = None) -> None:
         super().__init__()
         self.title("AI OS")
         self.geometry("1360x860")
@@ -41,6 +41,7 @@ class AIOSApp(tk.Tk):
         self.agent = AiderStyleAgent()
         self.pending_response = False
         self._bubble_refs: list[tk.Widget] = []
+        self.chat_memory: list[tuple[str, str]] = []
         self.current_file_path: Path | None = None
 
         self.settings_path = Path.home() / ".config" / "ai-os" / "settings.json"
@@ -51,6 +52,10 @@ class AIOSApp(tk.Tk):
         self.chats_dir = self.app_data_dir / "chats"
         self.chats_dir.mkdir(parents=True, exist_ok=True)
         self.chat_session_file = self._new_chat_session_file()
+        self.chat_sessions: list[Path] = []
+        self.written_index_file = self.app_data_dir / "written_files.json"
+        self.written_files: set[str] = set()
+        self._load_written_files_index()
         repo_candidate = Path.home() / "ai-os"
         self.workspace_root = repo_candidate.resolve() if repo_candidate.exists() else Path.cwd().resolve()
 
@@ -80,6 +85,24 @@ class AIOSApp(tk.Tk):
         )
         self._sync_live_audio_state()
         self._run_first_launch_setup()
+        self._handle_startup_path(startup_path)
+
+    def _handle_startup_path(self, startup_path: str | None) -> None:
+        if not startup_path:
+            return
+        try:
+            candidate = Path(startup_path).expanduser().resolve()
+        except Exception:
+            return
+        if candidate.is_dir():
+            self.workspace_root = candidate
+            self._refresh_file_tree()
+            self._append_console(f"[startup] opened workspace: {candidate}")
+        elif candidate.is_file():
+            self.workspace_root = candidate.parent.resolve()
+            self._refresh_file_tree()
+            self._load_file_to_editor(candidate)
+            self._append_console(f"[startup] opened file: {candidate}")
 
     def _run_first_launch_setup(self) -> None:
         if not bool(self.settings.get("use_venv_runtime", True)):
@@ -95,6 +118,7 @@ class AIOSApp(tk.Tk):
         file_path = self.chats_dir / f"chat_{stamp}.md"
         header = f"# AI OS Chat Session ({datetime.now().isoformat(timespec='seconds')})\n\n"
         file_path.write_text(header, encoding="utf-8")
+        self._refresh_chat_sessions_list()
         return file_path
 
     def _append_chat_history(self, role: str, text: str) -> None:
@@ -106,6 +130,29 @@ class AIOSApp(tk.Tk):
         except Exception as exc:
             self._append_console(f"[chat-save] failed: {exc}")
 
+    def _load_written_files_index(self) -> None:
+        try:
+            if not self.written_index_file.exists():
+                self.written_files = set()
+                return
+            data = json.loads(self.written_index_file.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                self.written_files = {str(item) for item in data if isinstance(item, str)}
+            else:
+                self.written_files = set()
+        except Exception:
+            self.written_files = set()
+
+    def _save_written_files_index(self) -> None:
+        try:
+            self.app_data_dir.mkdir(parents=True, exist_ok=True)
+            self.written_index_file.write_text(
+                json.dumps(sorted(self.written_files), indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self._append_console(f"[permissions] failed to save written-files index: {exc}")
+
     def open_chats_folder(self) -> None:
         try:
             opener = shutil.which("xdg-open")
@@ -116,6 +163,59 @@ class AIOSApp(tk.Tk):
             self._append_console(f"[chat-save] opened {self.chats_dir}")
         except Exception as exc:
             self._append_console(f"[chat-save] open folder failed: {exc}")
+
+    def _refresh_chat_sessions_list(self) -> None:
+        if not hasattr(self, "chat_listbox"):
+            return
+        try:
+            sessions = sorted(self.chats_dir.glob("chat_*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except Exception:
+            sessions = []
+        self.chat_sessions = sessions
+        self.chat_listbox.delete(0, tk.END)
+        for session in sessions:
+            self.chat_listbox.insert(tk.END, session.stem.replace("chat_", ""))
+        active = str(self.chat_session_file)
+        for idx, session in enumerate(self.chat_sessions):
+            if str(session) == active:
+                self.chat_listbox.selection_clear(0, tk.END)
+                self.chat_listbox.selection_set(idx)
+                self.chat_listbox.activate(idx)
+                break
+
+    def _on_chat_list_select(self, _event: tk.Event) -> None:
+        if not self.chat_listbox.curselection():
+            return
+        idx = int(self.chat_listbox.curselection()[0])
+        if idx < 0 or idx >= len(self.chat_sessions):
+            return
+        target = self.chat_sessions[idx]
+        if target == self.chat_session_file:
+            return
+        self._load_chat_session(target)
+
+    def _parse_chat_session(self, session_path: Path) -> list[tuple[str, str]]:
+        try:
+            text = session_path.read_text(encoding="utf-8")
+        except Exception:
+            return []
+        pattern = re.compile(r"^## \\[[^\\]]+\\] (assistant|user)\\n\\n(.*?)(?=\\n\\n## \\[|\\Z)", re.DOTALL | re.MULTILINE)
+        parsed: list[tuple[str, str]] = []
+        for role, body in pattern.findall(text):
+            parsed.append((role, body.strip()))
+        return parsed
+
+    def _load_chat_session(self, session_path: Path) -> None:
+        rows = self._parse_chat_session(session_path)
+        for bubble in self._bubble_refs:
+            bubble.destroy()
+        self._bubble_refs.clear()
+        self.chat_memory = []
+        self.chat_session_file = session_path
+        for role, message in rows:
+            self._add_message(role, message, persist=False)
+        self.status_var.set(f"Loaded chat: {session_path.stem}")
+        self._refresh_chat_sessions_list()
 
     def _init_speech_backend(self) -> None:
         global sr
@@ -355,13 +455,28 @@ class AIOSApp(tk.Tk):
             justify=tk.LEFT,
         ).pack(anchor="w", pady=(10, 0))
 
+        ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
+        ttk.Label(sidebar, text="Chats", style="SidebarTitle.TLabel").pack(anchor="w", pady=(0, 6))
+        self.chat_listbox = tk.Listbox(
+            sidebar,
+            bg="#0B1220",
+            fg="#E5E7EB",
+            selectbackground="#1F2937",
+            selectforeground="#E5E7EB",
+            relief=tk.FLAT,
+            height=16,
+        )
+        self.chat_listbox.pack(fill=tk.BOTH, expand=True)
+        self.chat_listbox.bind("<<ListboxSelect>>", self._on_chat_list_select)
+        self._refresh_chat_sessions_list()
+
     def _build_workspace(self, parent: ttk.Frame) -> None:
         workspace = ttk.Notebook(parent)
         workspace.grid(row=0, column=1, sticky="nsew")
 
         chat_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=0)
         code_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=10)
-        settings_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=12)
+        settings_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=0)
         marketplace_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=12)
 
         workspace.add(chat_tab, text="Chat")
@@ -372,7 +487,61 @@ class AIOSApp(tk.Tk):
         self._build_chat_tab(chat_tab)
         self._build_code_panel(code_tab)
         self._build_marketplace_tab(marketplace_tab)
-        self._build_settings_panel(settings_tab)
+        self._build_scrollable_settings_panel(settings_tab)
+
+    def _build_scrollable_settings_panel(self, parent: ttk.Frame) -> None:
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(parent, bg="#111827", highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        content = ttk.Frame(canvas, style="Panel.TFrame", padding=12)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _on_content_configure(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def _pointer_inside_canvas() -> bool:
+            try:
+                px, py = self.winfo_pointerx(), self.winfo_pointery()
+                left = canvas.winfo_rootx()
+                top = canvas.winfo_rooty()
+                right = left + canvas.winfo_width()
+                bottom = top + canvas.winfo_height()
+                return left <= px <= right and top <= py <= bottom
+            except Exception:
+                return False
+
+        def _on_mousewheel(event: tk.Event) -> None:
+            if not _pointer_inside_canvas():
+                return
+            delta = getattr(event, "delta", 0) or 0
+            if delta:
+                steps = -1 * int(delta / 120)
+                if steps != 0:
+                    canvas.yview_scroll(steps, "units")
+
+        def _on_mousewheel_linux(event: tk.Event) -> None:
+            if not _pointer_inside_canvas():
+                return
+            num = getattr(event, "num", 0)
+            if num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif num == 5:
+                canvas.yview_scroll(1, "units")
+
+        content.bind("<Configure>", _on_content_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel_linux)
+        canvas.bind_all("<Button-5>", _on_mousewheel_linux)
+        self._build_settings_panel(content)
 
     def _build_chat_tab(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
@@ -454,6 +623,8 @@ class AIOSApp(tk.Tk):
         self.file_tree.pack(fill=tk.BOTH, expand=True)
         self.file_tree.bind("<<TreeviewOpen>>", self._on_tree_open)
         self.file_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.file_tree.bind("<Double-1>", self._on_tree_activate)
+        self.file_tree.bind("<Return>", self._on_tree_activate)
 
         self.code_editor = scrolledtext.ScrolledText(
             editor_panel,
@@ -711,6 +882,10 @@ class AIOSApp(tk.Tk):
         button_row = ttk.Frame(parent, style="Panel.TFrame")
         button_row.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(button_row, text="Apply Settings", style="Primary.TButton", command=self.apply_settings).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Uninstall", style="Ghost.TButton", command=self.confirm_uninstall).pack(
+            side=tk.LEFT,
+            padx=(8, 0),
+        )
 
     def _build_marketplace_tab(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Extensions Marketplace (Open VSX Clone)", style="Title.TLabel").pack(anchor="w")
@@ -819,6 +994,33 @@ class AIOSApp(tk.Tk):
         self.status_var.set("Settings applied")
         self._append_console("Settings applied.")
 
+    def confirm_uninstall(self) -> None:
+        confirmed = messagebox.askyesno(
+            "Uninstall AI OS",
+            "Do you really want to uninstall?",
+        )
+        if not confirmed:
+            return
+        self._append_console("[uninstall] launching uninstall command in terminal")
+        self.status_var.set("Uninstall started")
+        self._launch_uninstall_command()
+
+    def _launch_uninstall_command(self) -> None:
+        uninstall_cmd = "sudo apt remove -y ai-os && sudo apt autoremove -y"
+        terminal = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xfce4-terminal")
+        try:
+            if terminal:
+                if terminal.endswith("gnome-terminal"):
+                    subprocess.Popen([terminal, "--", "bash", "-lc", uninstall_cmd])
+                elif terminal.endswith("xfce4-terminal"):
+                    subprocess.Popen([terminal, "--hold", "-e", f"bash -lc '{uninstall_cmd}'"])
+                else:
+                    subprocess.Popen([terminal, "-e", f"bash -lc '{uninstall_cmd}'"])
+            else:
+                self._append_console("[uninstall] no terminal emulator found; run: sudo apt remove -y ai-os")
+        except Exception as exc:
+            self._append_console(f"[uninstall] failed to start uninstall command: {exc}")
+
     def _on_check_all_permissions(self) -> None:
         all_enabled = self.perm_check_all_var.get()
         self.perm_workspace_var.set(all_enabled)
@@ -883,6 +1085,27 @@ class AIOSApp(tk.Tk):
         kind = values[1] if len(values) > 1 else ""
         if kind == "file":
             self._load_file_to_editor(path)
+
+    def _on_tree_activate(self, _event: tk.Event) -> None:
+        selected = self.file_tree.focus()
+        if not selected:
+            return
+        values = self.file_tree.item(selected, "values")
+        if not values:
+            return
+        path = Path(values[0])
+        self._open_path_in_system_app(path)
+
+    def _open_path_in_system_app(self, path: Path) -> None:
+        opener = shutil.which("xdg-open")
+        if not opener:
+            self._append_console(f"[open] xdg-open not found; path: {path}")
+            return
+        try:
+            subprocess.Popen([opener, str(path)])
+            self._append_console(f"[open] opened with system app: {path}")
+        except Exception as exc:
+            self._append_console(f"[open] failed: {exc}")
 
     def _load_file_to_editor(self, path: Path) -> None:
         try:
@@ -1010,6 +1233,8 @@ class AIOSApp(tk.Tk):
 
     def _is_path_allowed(self, target: Path) -> bool:
         resolved = target.resolve(strict=False)
+        if str(resolved) in self.written_files:
+            return True
         for root in self._allowed_roots():
             try:
                 resolved.relative_to(root.resolve(strict=False))
@@ -1092,11 +1317,14 @@ class AIOSApp(tk.Tk):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content + "\n", encoding="utf-8")
                 written += 1
+                self.written_files.add(str(target))
                 self._append_console(f"[auto-write] wrote {target}")
             except Exception as exc:
                 self._append_console(f"[auto-write] failed {target}: {exc}")
 
         if written or denied or invalid:
+            if written:
+                self._save_written_files_index()
             self.status_var.set(f"Auto-write: {written} written, {denied} denied, {invalid} invalid")
 
     def _enabled_models(self) -> dict[str, bool]:
@@ -1572,7 +1800,7 @@ class AIOSApp(tk.Tk):
         self.update_idletasks()
         self.chat_canvas.yview_moveto(1.0)
 
-    def _add_message(self, role: str, text: str) -> None:
+    def _add_message(self, role: str, text: str, persist: bool = True) -> None:
         row = ttk.Frame(self.chat_list, style="Panel.TFrame")
         row.pack(fill=tk.X, pady=6)
 
@@ -1610,7 +1838,11 @@ class AIOSApp(tk.Tk):
 
         self._bubble_refs.append(row)
         self._scroll_to_bottom()
-        self._append_chat_history(role, text)
+        if persist:
+            self._append_chat_history(role, text)
+        self.chat_memory.append((role, text))
+        if len(self.chat_memory) > 30:
+            self.chat_memory = self.chat_memory[-30:]
 
     def _add_user_message(self, text: str) -> None:
         self._add_message("user", text)
@@ -1692,6 +1924,11 @@ class AIOSApp(tk.Tk):
 
         interruption_note = self.interruption_note
         self.interruption_note = ""
+        memory_context = ""
+        if self.chat_memory:
+            last_items = self.chat_memory[-12:]
+            lines = [f"{role}: {text}" for role, text in last_items]
+            memory_context = "Conversation history (latest first to oldest):\n" + "\n".join(reversed(lines)) + "\n\n"
         run_prompt = prompt
         if bool(self.settings.get("auto_write_files", False)):
             run_prompt = (
@@ -1701,6 +1938,8 @@ class AIOSApp(tk.Tk):
                 "...file content...\n"
                 "```"
             )
+        if memory_context:
+            run_prompt = f"{memory_context}{run_prompt}"
 
         worker = threading.Thread(
             target=self._run_agent_prompt,
@@ -1738,6 +1977,7 @@ class AIOSApp(tk.Tk):
         for bubble in self._bubble_refs:
             bubble.destroy()
         self._bubble_refs.clear()
+        self.chat_memory = []
         self.chat_session_file = self._new_chat_session_file()
         self.status_var.set("Ready")
         self._add_assistant_message(
@@ -1840,7 +2080,8 @@ class AIOSApp(tk.Tk):
 
 
 def main() -> None:
-    app = AIOSApp()
+    startup_path = sys.argv[1] if len(sys.argv) > 1 else None
+    app = AIOSApp(startup_path=startup_path)
     app.mainloop()
 
 
