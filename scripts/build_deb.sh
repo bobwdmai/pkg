@@ -31,7 +31,7 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: AI OS Team <ai-os@example.com>
-Depends: python3, python3-tk, python3-speechrecognition, python3-pyaudio, espeak-ng
+Depends: python3, python3-tk, python3-pyaudio, python3-pip, espeak-ng
 Replaces: ai-os-v10, ai-os-v11, ai-os-v12, ai-os-system
 Conflicts: ai-os-v10, ai-os-v11, ai-os-v12, ai-os-system
 Description: AI OS desktop coding assistant

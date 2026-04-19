@@ -1,8 +1,12 @@
 import json
+import importlib.util
 import queue
 import re
 import shutil
+import site
 import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -32,6 +36,9 @@ class AIOSApp(tk.Tk):
 
         self.settings_path = Path.home() / ".config" / "ai-os" / "settings.json"
         self.settings = self._load_settings()
+        self.first_run_marker = self.settings_path.parent / ".first_run_complete"
+        self.app_data_dir = Path.home() / ".local" / "share" / "ai-os"
+        self.venv_dir = self.app_data_dir / "venv"
         repo_candidate = Path.home() / "ai-os"
         self.workspace_root = repo_candidate.resolve() if repo_candidate.exists() else Path.cwd().resolve()
 
@@ -42,6 +49,7 @@ class AIOSApp(tk.Tk):
         self.tts_lock = threading.Lock()
         self.tts_interrupted = False
 
+        self._init_speech_backend()
         self.sr_recognizer = sr.Recognizer() if sr else None
         self.sr_microphone = None
         self.stop_listening = None
@@ -53,6 +61,75 @@ class AIOSApp(tk.Tk):
             "AI OS ready. I can code, edit files, and now handle live voice interrupt when STT/TTS are enabled."
         )
         self._sync_live_audio_state()
+        self._run_first_launch_setup()
+
+    def _run_first_launch_setup(self) -> None:
+        if self.first_run_marker.exists():
+            return
+        self._append_console("[setup] first launch detected: running auto setup/build")
+        worker = threading.Thread(target=self._first_launch_setup_worker, daemon=True)
+        worker.start()
+
+    def _init_speech_backend(self) -> None:
+        global sr
+        if sr is not None:
+            return
+        try:
+            pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+            candidates = [
+                self.venv_dir / "lib" / pyver / "site-packages",
+                self.venv_dir / "lib64" / pyver / "site-packages",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    site.addsitedir(str(candidate))
+            import importlib
+            sr = importlib.import_module("speech_recognition")  # type: ignore[assignment]
+        except Exception:
+            sr = None  # type: ignore[assignment]
+
+    def _module_available(self, module_name: str) -> bool:
+        return importlib.util.find_spec(module_name) is not None
+
+    def _first_launch_setup_worker(self) -> None:
+        self.app_data_dir.mkdir(parents=True, exist_ok=True)
+        tasks: list[str] = []
+        if not self._module_available("speech_recognition"):
+            tasks.append("SpeechRecognition")
+
+        if not tasks:
+            self.first_run_marker.parent.mkdir(parents=True, exist_ok=True)
+            self.first_run_marker.write_text("ok\n", encoding="utf-8")
+            self.after(0, lambda: self._append_console("[setup] first launch setup complete"))
+            return
+
+        if not self.venv_dir.exists():
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "venv", "--system-site-packages", str(self.venv_dir)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=True,
+                )
+            except Exception as exc:
+                self.after(0, lambda: self._append_console(f"[setup] venv create failed: {exc}"))
+                return
+
+        pip_cmd = [str(self.venv_dir / "bin" / "python3"), "-m", "pip", "install", *tasks]
+        try:
+            proc = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode == 0:
+                self.first_run_marker.parent.mkdir(parents=True, exist_ok=True)
+                self.first_run_marker.write_text("ok\n", encoding="utf-8")
+                self._init_speech_backend()
+                self.sr_recognizer = sr.Recognizer() if sr else None
+                self.after(0, lambda: self._append_console("[setup] installed missing STT dependencies (venv)"))
+            else:
+                details = (proc.stderr or proc.stdout).strip()
+                self.after(0, lambda: self._append_console(f"[setup] auto install failed: {details}"))
+        except Exception as exc:
+            self.after(0, lambda: self._append_console(f"[setup] auto setup failed: {exc}"))
 
     def _default_settings(self) -> dict:
         return {
@@ -711,7 +788,13 @@ class AIOSApp(tk.Tk):
 
     def start_manual_stt(self) -> None:
         if sr is None or not self.sr_recognizer:
-            self._append_console("[voice] speech_recognition not installed; manual STT unavailable")
+            fallback_text = self._manual_stt_external_fallback()
+            if fallback_text:
+                self._manual_stt_success(fallback_text)
+                return
+            self._append_console(
+                "[voice] manual STT unavailable. Install: sudo apt install python3-pyaudio python3-venv python3-pip"
+            )
             self.status_var.set("Manual STT unavailable")
             return
 
@@ -719,6 +802,64 @@ class AIOSApp(tk.Tk):
         self._append_console("[voice] manual STT listening...")
         worker = threading.Thread(target=self._manual_stt_worker, daemon=True)
         worker.start()
+
+    def _manual_stt_external_fallback(self) -> str:
+        arecord_bin = shutil.which("arecord")
+        whisper_bin = shutil.which("whisper")
+        if not arecord_bin or not whisper_bin:
+            return ""
+
+        self._append_console("[voice] fallback STT: recording with arecord, transcribing with whisper")
+        with tempfile.TemporaryDirectory(prefix="ai_os_stt_") as temp_dir:
+            wav_path = Path(temp_dir) / "manual.wav"
+            cmd_record = [
+                arecord_bin,
+                "-q",
+                "-f",
+                "S16_LE",
+                "-r",
+                "16000",
+                "-c",
+                "1",
+                "-d",
+                "8",
+                str(wav_path),
+            ]
+            try:
+                rec = subprocess.run(cmd_record, capture_output=True, text=True, timeout=12)
+            except Exception as exc:
+                self._append_console(f"[voice] fallback record failed: {exc}")
+                return ""
+            if rec.returncode != 0:
+                self._append_console(f"[voice] fallback record failed: {rec.stderr.strip()}")
+                return ""
+
+            cmd_whisper = [
+                whisper_bin,
+                str(wav_path),
+                "--model",
+                "tiny",
+                "--language",
+                "en",
+                "--output_format",
+                "txt",
+                "--output_dir",
+                temp_dir,
+            ]
+            try:
+                tr = subprocess.run(cmd_whisper, capture_output=True, text=True, timeout=60)
+            except Exception as exc:
+                self._append_console(f"[voice] fallback transcribe failed: {exc}")
+                return ""
+            if tr.returncode != 0:
+                details = tr.stderr.strip() or tr.stdout.strip()
+                self._append_console(f"[voice] fallback transcribe failed: {details}")
+                return ""
+
+            txt_path = Path(temp_dir) / "manual.txt"
+            if not txt_path.exists():
+                return ""
+            return txt_path.read_text(encoding="utf-8").strip()
 
     def _manual_stt_worker(self) -> None:
         if not self.sr_recognizer:
