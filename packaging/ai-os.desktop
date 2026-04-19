@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=AI OS
+GenericName=AI Coding Assistant
+Comment=Local multi-model coding assistant
+Exec=/usr/bin/ai-os
+Icon=applications-development
+Terminal=false
+Categories=Development;IDE;
+Keywords=AI;Coding;IDE;Assistant;Ollama;
+StartupNotify=true
+StartupWMClass=AI OS
