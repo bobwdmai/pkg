@@ -30,6 +30,46 @@ except Exception:  # pragma: no cover
 
 class AIOSApp(tk.Tk):
     VOICE_INDICATOR_PREFIX = "[voice-wave] "
+    RUN_LANGUAGE_OPTIONS = [
+        "Auto (from file)",
+        "Python (.py)",
+        "Shell (.sh)",
+        "JavaScript (.js)",
+        "TypeScript (.ts)",
+        "Ruby (.rb)",
+        "Perl (.pl)",
+        "PHP (.php)",
+        "Lua (.lua)",
+        "R (.r)",
+        "Swift (.swift)",
+        "PowerShell (.ps1)",
+        "C (.c)",
+        "C++ (.cpp)",
+        "Go (.go)",
+        "Rust (.rs)",
+        "Java (.java)",
+        "Kotlin (.kt)",
+    ]
+    RUN_LANGUAGE_EXTENSION_MAP = {
+        "Auto (from file)": "",
+        "Python (.py)": ".py",
+        "Shell (.sh)": ".sh",
+        "JavaScript (.js)": ".js",
+        "TypeScript (.ts)": ".ts",
+        "Ruby (.rb)": ".rb",
+        "Perl (.pl)": ".pl",
+        "PHP (.php)": ".php",
+        "Lua (.lua)": ".lua",
+        "R (.r)": ".r",
+        "Swift (.swift)": ".swift",
+        "PowerShell (.ps1)": ".ps1",
+        "C (.c)": ".c",
+        "C++ (.cpp)": ".cpp",
+        "Go (.go)": ".go",
+        "Rust (.rs)": ".rs",
+        "Java (.java)": ".java",
+        "Kotlin (.kt)": ".kt",
+    }
 
     def __init__(self, startup_path: str | None = None) -> None:
         super().__init__()
@@ -477,16 +517,13 @@ class AIOSApp(tk.Tk):
         chat_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=0)
         code_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=10)
         settings_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=0)
-        marketplace_tab = ttk.Frame(workspace, style="Panel.TFrame", padding=12)
 
         workspace.add(chat_tab, text="Chat")
         workspace.add(code_tab, text="Code")
-        workspace.add(marketplace_tab, text="Marketplace")
         workspace.add(settings_tab, text="Settings")
 
         self._build_chat_tab(chat_tab)
         self._build_code_panel(code_tab)
-        self._build_marketplace_tab(marketplace_tab)
         self._build_scrollable_settings_panel(settings_tab)
 
     def _build_scrollable_settings_panel(self, parent: ttk.Frame) -> None:
@@ -608,6 +645,15 @@ class AIOSApp(tk.Tk):
         ttk.Button(editor_row, text="Save Folder", style="Ghost.TButton", command=self.save_folder_snapshot).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(editor_row, text="Open File", style="Ghost.TButton", command=self.open_file).pack(side=tk.LEFT)
         ttk.Button(editor_row, text="Save File", style="Ghost.TButton", command=self.save_file).pack(side=tk.LEFT, padx=(8, 0))
+        self.run_language_var = tk.StringVar(value="Auto (from file)")
+        self.run_language_combo = ttk.Combobox(
+            editor_row,
+            state="readonly",
+            textvariable=self.run_language_var,
+            values=self.RUN_LANGUAGE_OPTIONS,
+            width=20,
+        )
+        self.run_language_combo.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(editor_row, text="Run Code", style="Primary.TButton", command=self.run_code).pack(side=tk.LEFT, padx=(8, 0))
 
         body = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
@@ -644,10 +690,9 @@ class AIOSApp(tk.Tk):
 
         io_header = ttk.Frame(parent, style="Panel.TFrame")
         io_header.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(io_header, text="Console", style="Meta.TLabel").pack(side=tk.LEFT)
         self.io_mode_var = tk.StringVar(value="console")
         ttk.Button(io_header, text="Console", style="Ghost.TButton", command=lambda: self._set_io_mode("console")).pack(
-            side=tk.LEFT, padx=(10, 0)
+            side=tk.LEFT, padx=(0, 0)
         )
         ttk.Button(io_header, text="Terminal", style="Ghost.TButton", command=lambda: self._set_io_mode("terminal")).pack(
             side=tk.LEFT, padx=(6, 0)
@@ -1991,14 +2036,19 @@ class AIOSApp(tk.Tk):
             self.status_var.set("Run denied by permissions")
             return
         source = self.code_editor.get("1.0", tk.END)
-        ext = ".py"
-        if self.current_file_path:
+        selected_language = self.run_language_var.get() if hasattr(self, "run_language_var") else "Auto (from file)"
+        selected_ext = self.RUN_LANGUAGE_EXTENSION_MAP.get(selected_language, "")
+        if selected_ext:
+            ext = selected_ext
+        elif self.current_file_path:
             ext = self.current_file_path.suffix.lower() or ".py"
+        else:
+            ext = ".py"
         if not self._is_extension_allowed(Path(f"snippet{ext}")):
             self._append_console(f"[run denied] extension not allowed: {ext}")
             self.status_var.set("Run denied by file-type permissions")
             return
-        self._append_console("Running code...")
+        self._append_console(f"Running code as {ext}...")
         python_cmd = "python3"
         if bool(self.settings.get("use_venv_runtime", True)):
             venv_python = self.venv_dir / "bin" / "python3"
